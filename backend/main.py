@@ -1,13 +1,19 @@
 import os
+import json
 import sqlite3
 import random
 import jwt
 import bcrypt
 from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 from fastapi import FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+load_dotenv()
 
 app = FastAPI(
     title="FilmLog Backend API",
@@ -20,7 +26,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
 DB_PATH = "filmlog.db"
@@ -41,6 +47,18 @@ class LoginRequest(BaseModel):
     email: str
     password: str
 
+class WatchlistRequest(BaseModel):
+    movie_id: int | None = None
+    movieId: int | None = None
+    id: int | None = None
+
+class WatchedRequest(BaseModel):
+    movie_id: int | None = None
+    movieId: int | None = None
+    id: int | None = None
+    rating: int
+    review: str | None = ""
+
 def create_jwt_token(user_id: int, username: str, email: str):
     payload = {
         "user_id": user_id,
@@ -49,6 +67,16 @@ def create_jwt_token(user_id: int, username: str, email: str):
         "exp": datetime.now(timezone.utc) + timedelta(hours=24)
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_current_user_id(authorization: str | None = Header(default=None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization.split(" ")[1]
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload.get("user_id")
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return None
 
 # 1. Menampilkan semua film
 @app.get("/api/movies")
@@ -161,26 +189,7 @@ def login_user(data: LoginRequest):
         }
     }
 
-    class WatchlistRequest(BaseModel):
-        movie_id: int
-
-# Fungsi pembantu untuk memeriksa keaslian token JWT dari Header Authorization
-class WatchlistRequest(BaseModel):
-    movie_id: int | None = None
-    movieId: int | None = None
-    id: int | None = None
-
-def get_current_user_id(authorization: str | None = Header(default=None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        return None
-    token = authorization.split(" ")[1]
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload.get("user_id")
-    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
-        return None
-
-# 5. Menampilkan daftar film di Watchlist milik pengguna yang sedang login
+# 5. Menampilkan daftar film di Watchlist
 @app.get("/api/watchlist")
 def get_watchlist(authorization: str | None = Header(default=None)):
     user_id = get_current_user_id(authorization)
@@ -259,14 +268,7 @@ def remove_from_watchlist(movie_id: int, authorization: str | None = Header(defa
 
     return {"message": "Film berhasil dihapus dari watchlist"}
 
-class WatchedRequest(BaseModel):
-    movie_id: int | None = None
-    movieId: int | None = None
-    id: int | None = None
-    rating: int
-    review: str | None = ""
-
-# 8. Menampilkan daftar film yang sudah ditonton beserta rating & ulasan
+# 8. Menampilkan daftar film yang sudah ditonton
 @app.get("/api/watched")
 def get_watched(authorization: str | None = Header(default=None)):
     user_id = get_current_user_id(authorization)
@@ -287,7 +289,7 @@ def get_watched(authorization: str | None = Header(default=None)):
 
     return [dict(row) for row in rows]
 
-# 9. Mencatat film yang sudah ditonton, rating (1-5), dan ulasan
+# 9. Mencatat film yang sudah ditonton beserta rating & ulasan
 @app.post("/api/watched")
 def add_to_watched(data: WatchedRequest, authorization: str | None = Header(default=None)):
     user_id = get_current_user_id(authorization)
@@ -309,7 +311,6 @@ def add_to_watched(data: WatchedRequest, authorization: str | None = Header(defa
         conn.close()
         return JSONResponse(status_code=404, content={"message": "Film tidak ditemukan"})
 
-    # Jika pengguna sudah pernah mengulas film ini, perbarui rating dan ulasannya
     cursor.execute(
         "SELECT id FROM watched WHERE user_id = ? AND movie_id = ?",
         (user_id, target_movie_id)
@@ -327,7 +328,6 @@ def add_to_watched(data: WatchedRequest, authorization: str | None = Header(defa
             (user_id, target_movie_id, data.rating, data.review or "")
         )
 
-    # Otomatis hapus dari watchlist jika film tersebut sudah selesai ditonton
     cursor.execute(
         "DELETE FROM watchlists WHERE user_id = ? AND movie_id = ?",
         (user_id, target_movie_id)
@@ -337,3 +337,93 @@ def add_to_watched(data: WatchedRequest, authorization: str | None = Header(defa
     conn.close()
 
     return JSONResponse(status_code=201, content={"message": "Ulasan film berhasil disimpan"})
+
+class RecommendRequest(BaseModel):
+    prompt: str | None = None
+    query: str | None = None
+    description: str | None = None
+
+# 10. Rekomendasi film dengan Google Gemini AI
+@app.post("/api/movies/recommend")
+def recommend_movie(data: RecommendRequest):
+    user_input = data.prompt or data.query or data.description
+    if not user_input or not user_input.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"message": "Deskripsi mood atau preferensi film wajib diisi"}
+        )
+
+    print(f"\n[AI] 1. Menerima prompt: {user_input}")
+
+    load_dotenv(override=True)
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return JSONResponse(
+            status_code=500,
+            content={"message": "GEMINI_API_KEY belum dipasang di file backend/.env"}
+        )
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM movies")
+    rows = cursor.fetchall()
+    conn.close()
+
+    movies = [dict(row) for row in rows]
+    if not movies:
+        return JSONResponse(
+            status_code=404,
+            content={"message": "Data film di database kosong"}
+        )
+
+    catalog_context = json.dumps(
+        [
+            {
+                "id": m["id"],
+                "title": m.get("title"),
+                "genres": m.get("genres") or m.get("genre"),
+                "synopsis": (m.get("synopsis") or m.get("description") or "")[:120]
+            }
+            for m in movies
+        ],
+        ensure_ascii=False
+    )
+
+    system_instruction = f"""
+    Pilih SATU film yang paling cocok dengan permintaan pengguna HANYA dari daftar berikut:
+    {catalog_context}
+
+    Balas HANYA dalam JSON murni:
+    {{"movie_id": <angka id film>, "reasoning": "<alasan singkat 2 kalimat bahasa Indonesia>"}}
+    """
+
+    try:
+        print("[AI] 2. Menghubungi Gemini API (gemini-3.8-flash)...")
+        client = genai.Client(api_key=api_key.strip())
+        response = client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=user_input,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                temperature=0.3,
+            ),
+        )
+
+        raw_text = response.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        print(f"[AI] 3. Jawaban Gemini: {raw_text}")
+        result = json.loads(raw_text)
+
+        selected_id = int(result.get("movie_id", movies[0]["id"]))
+        reasoning = result.get("reasoning", "Film ini sangat cocok dengan suasana hatimu saat ini.")
+
+        return {
+            "movie_id": selected_id,
+            "reasoning": reasoning
+        }
+    except Exception as e:
+        print("[AI] DETAIL ERROR:", repr(e))
+        return JSONResponse(
+            status_code=500,
+            content={"message": f"Gagal memproses rekomendasi AI: {str(e)}"}
+        )
