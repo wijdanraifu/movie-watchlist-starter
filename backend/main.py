@@ -4,7 +4,7 @@ import random
 import jwt
 import bcrypt
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -160,3 +160,101 @@ def login_user(data: LoginRequest):
             "email": user["email"]
         }
     }
+
+    class WatchlistRequest(BaseModel):
+        movie_id: int
+
+# Fungsi pembantu untuk memeriksa keaslian token JWT dari Header Authorization
+class WatchlistRequest(BaseModel):
+    movie_id: int | None = None
+    movieId: int | None = None
+    id: int | None = None
+
+def get_current_user_id(authorization: str | None = Header(default=None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization.split(" ")[1]
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload.get("user_id")
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return None
+
+# 5. Menampilkan daftar film di Watchlist milik pengguna yang sedang login
+@app.get("/api/watchlist")
+def get_watchlist(authorization: str | None = Header(default=None)):
+    user_id = get_current_user_id(authorization)
+    if user_id is None:
+        return JSONResponse(status_code=401, content={"message": "Silakan login terlebih dahulu"})
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT m.*
+        FROM watchlists w
+        JOIN movies m ON w.movie_id = m.id
+        WHERE w.user_id = ?
+        ORDER BY w.id DESC
+    """, (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+# 6. Menambahkan film ke dalam Watchlist
+@app.post("/api/watchlist")
+def add_to_watchlist(data: WatchlistRequest, authorization: str | None = Header(default=None)):
+    user_id = get_current_user_id(authorization)
+    if user_id is None:
+        return JSONResponse(status_code=401, content={"message": "Silakan login terlebih dahulu"})
+
+    target_movie_id = data.movie_id or data.movieId or data.id
+    if target_movie_id is None:
+        return JSONResponse(status_code=400, content={"message": "ID film tidak valid"})
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT id FROM movies WHERE id = ?", (target_movie_id,))
+    if cursor.fetchone() is None:
+        conn.close()
+        return JSONResponse(status_code=404, content={"message": "Film tidak ditemukan"})
+
+    cursor.execute(
+        "SELECT id FROM watchlists WHERE user_id = ? AND movie_id = ?",
+        (user_id, target_movie_id)
+    )
+    if cursor.fetchone() is not None:
+        conn.close()
+        return JSONResponse(status_code=409, content={"message": "Film sudah ada di watchlist kamu"})
+
+    cursor.execute(
+        "INSERT INTO watchlists (user_id, movie_id) VALUES (?, ?)",
+        (user_id, target_movie_id)
+    )
+    conn.commit()
+    conn.close()
+
+    return JSONResponse(status_code=201, content={"message": "Film berhasil ditambahkan ke watchlist"})
+
+# 7. Menghapus film dari Watchlist
+@app.delete("/api/watchlist/{movie_id}")
+def remove_from_watchlist(movie_id: int, authorization: str | None = Header(default=None)):
+    user_id = get_current_user_id(authorization)
+    if user_id is None:
+        return JSONResponse(status_code=401, content={"message": "Silakan login terlebih dahulu"})
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM watchlists WHERE user_id = ? AND movie_id = ?",
+        (user_id, movie_id)
+    )
+    conn.commit()
+    deleted_rows = cursor.rowcount
+    conn.close()
+
+    if deleted_rows == 0:
+        return JSONResponse(status_code=404, content={"message": "Film tidak ditemukan di watchlist"})
+
+    return {"message": "Film berhasil dihapus dari watchlist"}
