@@ -258,3 +258,82 @@ def remove_from_watchlist(movie_id: int, authorization: str | None = Header(defa
         return JSONResponse(status_code=404, content={"message": "Film tidak ditemukan di watchlist"})
 
     return {"message": "Film berhasil dihapus dari watchlist"}
+
+class WatchedRequest(BaseModel):
+    movie_id: int | None = None
+    movieId: int | None = None
+    id: int | None = None
+    rating: int
+    review: str | None = ""
+
+# 8. Menampilkan daftar film yang sudah ditonton beserta rating & ulasan
+@app.get("/api/watched")
+def get_watched(authorization: str | None = Header(default=None)):
+    user_id = get_current_user_id(authorization)
+    if user_id is None:
+        return JSONResponse(status_code=401, content={"message": "Silakan login terlebih dahulu"})
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT m.*, w.id AS watched_id, w.movie_id, w.rating, w.rating AS user_rating, w.review
+        FROM watched w
+        JOIN movies m ON w.movie_id = m.id
+        WHERE w.user_id = ?
+        ORDER BY w.id DESC
+    """, (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+# 9. Mencatat film yang sudah ditonton, rating (1-5), dan ulasan
+@app.post("/api/watched")
+def add_to_watched(data: WatchedRequest, authorization: str | None = Header(default=None)):
+    user_id = get_current_user_id(authorization)
+    if user_id is None:
+        return JSONResponse(status_code=401, content={"message": "Silakan login terlebih dahulu"})
+
+    target_movie_id = data.movie_id or data.movieId or data.id
+    if target_movie_id is None:
+        return JSONResponse(status_code=400, content={"message": "ID film tidak valid"})
+
+    if data.rating < 1 or data.rating > 5:
+        return JSONResponse(status_code=400, content={"message": "Rating harus bernilai antara 1 sampai 5"})
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT id FROM movies WHERE id = ?", (target_movie_id,))
+    if cursor.fetchone() is None:
+        conn.close()
+        return JSONResponse(status_code=404, content={"message": "Film tidak ditemukan"})
+
+    # Jika pengguna sudah pernah mengulas film ini, perbarui rating dan ulasannya
+    cursor.execute(
+        "SELECT id FROM watched WHERE user_id = ? AND movie_id = ?",
+        (user_id, target_movie_id)
+    )
+    existing = cursor.fetchone()
+
+    if existing is not None:
+        cursor.execute(
+            "UPDATE watched SET rating = ?, review = ? WHERE id = ?",
+            (data.rating, data.review or "", existing["id"])
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO watched (user_id, movie_id, rating, review) VALUES (?, ?, ?, ?)",
+            (user_id, target_movie_id, data.rating, data.review or "")
+        )
+
+    # Otomatis hapus dari watchlist jika film tersebut sudah selesai ditonton
+    cursor.execute(
+        "DELETE FROM watchlists WHERE user_id = ? AND movie_id = ?",
+        (user_id, target_movie_id)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return JSONResponse(status_code=201, content={"message": "Ulasan film berhasil disimpan"})
